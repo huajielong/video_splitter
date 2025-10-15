@@ -7,7 +7,11 @@ import datetime
 import tempfile
 import threading
 import logging
+import warnings
 from collections import Counter
+import concurrent.futures
+import multiprocessing
+import time
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,6 +58,10 @@ class VideoSplitterApp:
         self.root.title("视频自动拼接与移动工具")
         self.root.geometry("800x600")
         self.root.resizable(False, False)
+        
+        # 抑制MoviePy的帧读取警告，提高用户体验
+        # 这会抑制所有UserWarning类型的警告
+        warnings.filterwarnings("ignore", category=Warning, module="moviepy")
         
         # 设置中文字体支持
         self.style = ttk.Style()
@@ -232,6 +240,9 @@ class VideoSplitterApp:
         self.is_processing = True
         self.start_button.config(state=tk.DISABLED)
         
+        # 记录开始处理的时间
+        self.processing_start_time = time.time()
+        
         # 重置统计信息
         self.stats = {
             'successfully_spliced': 0,
@@ -323,49 +334,106 @@ class VideoSplitterApp:
             self.cleanup_temp_files()
             self.root.after(0, self.finish_processing)
     
+    def _preprocess_single_video(self, filename):
+        """预处理单个视频，用于并行处理"""
+        result = {}
+        file_path = os.path.join(self.folder_a.get(), filename)
+        
+        try:
+            # 检查视频是否损坏
+            clip = VideoFileClip(file_path)
+            duration = clip.duration
+            clip.close()
+            
+            # 检查时长是否为0
+            if duration <= 0:
+                result['status'] = 'deleted_empty'
+                result['filename'] = filename
+                return result
+            
+            # 预处理：生成9:16黑色画布+画中画
+            canvas_file = self.create_canvas_video(file_path, filename)
+            if canvas_file:
+                result['status'] = 'success'
+                result['canvas_file'] = canvas_file
+                result['orig_path'] = file_path
+                result['duration'] = duration
+                result['filename'] = filename
+            else:
+                result['status'] = 'deleted_failed_preprocess'
+                result['filename'] = filename
+                    
+        except Exception as e:
+            result['status'] = 'deleted_corrupt'
+            result['filename'] = filename
+            result['error'] = str(e)
+            
+        return result
+    
     def preprocess_videos(self):
+        """预处理视频，支持并行处理"""
         mp4_files = [f for f in os.listdir(self.folder_a.get()) if f.lower().endswith('.mp4')]
         canvas_files = []
         total_files = len(mp4_files)
         
-        for i, filename in enumerate(mp4_files):
-            if not self.is_processing:
-                break
+        # 统计变量
+        processed_count = 0
+        
+        # 使用线程池并行处理视频
+        # 获取CPU核心数，线程数设为核心数的1-2倍（考虑到I/O等待）
+        max_workers = min(multiprocessing.cpu_count() * 2, len(mp4_files))
+        self.append_status(f"开始并行预处理视频，使用{max_workers}个线程")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            future_to_video = {executor.submit(self._preprocess_single_video, filename): filename for filename in mp4_files}
             
-            file_path = os.path.join(self.folder_a.get(), filename)
-            self.update_progress(f"正在预处理视频 ({i+1}/{total_files})")
-            self.append_status(f"预处理视频: {filename}")
-            
-            try:
-                # 检查视频是否损坏
-                clip = VideoFileClip(file_path)
-                duration = clip.duration
-                clip.close()
+            # 处理完成的任务
+            for future in concurrent.futures.as_completed(future_to_video):
+                if not self.is_processing:
+                    # 取消所有剩余任务
+                    for f in future_to_video:
+                        if not f.done():
+                            f.cancel()
+                    break
                 
-                # 检查时长是否为0
-                if duration <= 0:
-                    self.append_status(f"文件时长为0，删除: {filename}")
-                    os.remove(file_path)
-                    self.stats['deleted_empty'] += 1
-                    continue
+                processed_count += 1
+                self.update_progress(f"正在预处理视频 ({processed_count}/{total_files})")
                 
-                # 预处理：生成9:16黑色画布+画中画
-                canvas_file = self.create_canvas_video(file_path, filename)
-                if canvas_file:
-                    canvas_files.append((canvas_file, file_path, duration))
-                    self.stats['preprocessed_files'] += 1
-                else:
-                    self.append_status(f"预处理失败，删除: {filename}")
-                    os.remove(file_path)
-                    self.stats['deleted_failed_preprocess'] += 1
-                    
-            except Exception as e:
-                self.append_status(f"文件损坏，删除: {filename} ({str(e)})")
                 try:
-                    os.remove(file_path)
-                    self.stats['deleted_corrupt'] += 1
-                except:
-                    pass
+                    result = future.result()
+                    filename = result['filename']
+                    
+                    # 根据处理结果更新统计和状态
+                    if result['status'] == 'success':
+                        self.append_status(f"预处理成功: {filename}")
+                        canvas_files.append((result['canvas_file'], result['orig_path'], result['duration']))
+                        self.stats['preprocessed_files'] += 1
+                    elif result['status'] == 'deleted_empty':
+                        self.append_status(f"文件时长为0，删除: {filename}")
+                        try:
+                            os.remove(os.path.join(self.folder_a.get(), filename))
+                            self.stats['deleted_empty'] += 1
+                        except:
+                            pass
+                    elif result['status'] == 'deleted_failed_preprocess':
+                        self.append_status(f"预处理失败，删除: {filename}")
+                        try:
+                            os.remove(os.path.join(self.folder_a.get(), filename))
+                            self.stats['deleted_failed_preprocess'] += 1
+                        except:
+                            pass
+                    elif result['status'] == 'deleted_corrupt':
+                        error_msg = result.get('error', '未知错误')
+                        self.append_status(f"文件损坏，删除: {filename} ({error_msg})")
+                        try:
+                            os.remove(os.path.join(self.folder_a.get(), filename))
+                            self.stats['deleted_corrupt'] += 1
+                        except:
+                            pass
+                except Exception as e:
+                    filename = future_to_video[future]
+                    self.append_status(f"处理视频时发生异常: {filename} ({str(e)})")
         
         # 检查是否有预处理失败的视频
         if self.stats['deleted_failed_preprocess'] > 0:
@@ -403,15 +471,16 @@ class VideoSplitterApp:
             # 使用ffmpeg命令行工具来创建9:16画布并将原视频居中放置
             # 这种方法可以避免使用moviepy中存在兼容性问题的API
             import subprocess
+            # 优化FFmpeg参数，使用更快的编码预设
             ffmpeg_cmd = [
-                'ffmpeg', '-y',
+                'ffmpeg', '-y', '-threads', '0',  # 0表示使用所有可用线程
                 '-i', video_path,
                 '-f', 'lavfi', '-i', f'color=c=black:s={canvas_width}x{canvas_height}:d={duration}',
                 '-filter_complex', f'[0:v]scale={new_width}:{new_height}[v1];[1:v][v1]overlay={x_pos}:{y_pos}[v]',
                 '-map', '[v]', '-map', '0:a',
-                '-c:v', 'libx264', '-crf', '23', '-preset', 'medium',
-                '-c:a', 'aac', '-b:a', '128k',
-                '-shortest',
+                '-c:v', 'libx264', '-crf', '25', '-preset', 'ultrafast',  # 更快的预设
+                '-c:a', 'aac', '-b:a', '96k',  # 降低音频比特率以提高速度
+                '-shortest', '-movflags', '+faststart',  # 启用快速启动
                 output_path
             ]
             
@@ -535,57 +604,86 @@ class VideoSplitterApp:
                         break
                     
                     # 拼接视频
-                    self.append_status(f"开始拼接视频序列（总时长：{current_duration:.1f}秒）")
+                    self.append_status(f"开始拼接视频序列...")
                     
                     processing_aborted = False
                     final_clip = None
                     clips = []
                     try:
-                        # 加载所有视频文件
-                        for canvas_file_seq, _, _, _, _, _ in current_sequence:
-                            # 加载每个视频文件前检查终止标志
-                            if not self.is_processing:
-                                self.append_status("处理已终止，取消视频加载")
-                                processing_aborted = True
-                                break
-                            
-                            clip = VideoFileClip(canvas_file_seq)
-                            clips.append(clip)
+                        # 优化：直接使用文件路径列表进行拼接，避免提前加载所有视频
+                        clip_paths = [canvas_file_seq for canvas_file_seq, _, _, _, _, _ in current_sequence]
                         
-                        # 如果处理被终止，跳过后续操作
-                        if processing_aborted or not self.is_processing:
-                            continue
-                        
-                        # 拼接视频
-                        final_clip = concatenate_videoclips(clips)
+                        # 在开始写入前再次检查终止标志
+                        if not self.is_processing:
+                            self.append_status("处理已终止，取消视频拼接")
+                            processing_aborted = True
+                            break
                         
                         # 构建输出文件名
                         base_names = [os.path.splitext(os.path.basename(f[0]))[0] for f in current_sequence]
                         safe_name = self.filter_filename("+".join(base_names))
                         output_path = os.path.join(self.folder_b.get(), f"{safe_name}.mp4")
                         
-                        # 在开始写入前再次检查终止标志
-                        if not self.is_processing:
-                            self.append_status("处理已终止，取消视频写入")
-                            processing_aborted = True
+                        # 拼接视频（添加更健壮的视频加载处理）
+                        # 使用compose方法更高效地处理不同分辨率的视频
+                        clips = []
+                        for path in clip_paths:
+                            try:
+                                # 尝试加载视频，如果出现警告则继续执行
+                                with warnings.catch_warnings():
+                                    warnings.simplefilter("ignore")
+                                    clip = VideoFileClip(path)
+                                clips.append(clip)
+                            except Exception as e:
+                                self.append_status(f"加载视频文件时出错: {os.path.basename(path)} ({str(e)})")
+                                # 跳过有问题的视频，继续处理其他视频
+                                continue
                         
-                        # 保存拼接后的视频
-                        if not processing_aborted:
-                            final_clip.write_videofile(output_path, codec="libx264", fps=30, audio_codec="aac")
+                        if not clips:
+                            self.append_status("没有成功加载的视频文件，跳过此序列的拼接")
+                            continue
+                        
+                        final_clip = concatenate_videoclips(clips, method="compose")
+                        
+                        # 记录帧处理开始时间
+                        frame_processing_start = time.time()
+                        
+                        # 保存拼接后的视频，使用优化的编码参数
+                        final_clip.write_videofile(
+                            output_path,
+                            codec="libx264",
+                            fps=30,
+                            audio_codec="aac",
+                            preset="ultrafast",  # 使用更快的预设
+                            audio_bitrate="96k",  # 降低音频比特率以提高速度
+                            threads=None  # 自动使用多个线程
+                        )
+                        
+                        # 记录帧处理结束时间
+                        frame_processing_time = time.time() - frame_processing_start
+                        minutes, seconds = divmod(frame_processing_time, 60)
+                        self.append_status(f"帧处理耗时：{int(minutes)}分{seconds:.1f}秒")
+                        # 保存到统计信息中
+                        if 'frame_processing_times' not in self.stats:
+                            self.stats['frame_processing_times'] = []
+                        self.stats['frame_processing_times'].append(frame_processing_time)
                         
                         # 记录统计信息
-                        if not processing_aborted:
-                            self.stats['successfully_spliced'] += 1
-                            self.stats['spliced_durations'].append(current_duration)
+                        self.stats['successfully_spliced'] += 1
+                        # 计算总时长（包含视频时长和帧处理时长）
+                        total_duration = current_duration + frame_processing_time
+                        # 保存总时长到统计信息
+                        self.stats['spliced_durations'].append(total_duration)
+                        self.append_status(f"视频序列拼接完成（总时长：{total_duration:.1f}秒，其中视频内容时长{current_duration:.1f}秒，帧处理耗时{frame_processing_time:.1f}秒）")
                         
                         # 如果需要删除源文件
-                        if not processing_aborted and self.delete_source.get():
+                        if self.delete_source.get():
                             for _, orig_path_seq, _, _, _, _ in current_sequence:
                                 source_files_to_delete.add(orig_path_seq)
                         
                     except Exception as e:
                         self.append_status(f"拼接视频时出错: {str(e)}")
-                        self.logger.error(f"拼接视频时出错: {str(e)}")
+                        logger.error(f"拼接视频时出错: {str(e)}")
                     finally:
                         # 确保关闭所有视频资源
                         if final_clip:
@@ -644,25 +742,53 @@ class VideoSplitterApp:
     
     def show_summary(self):
         # 显示处理结果汇总
-        summary = "处理完成！\n"
-        summary += f"- 目标拼接时长：{self.stats['target_duration']}秒\n"
-        summary += f"- 预处理：成功生成{self.stats['preprocessed_files']}个画布版视频，清理{self.stats['deleted_corrupt']}个损坏文件、{self.stats['deleted_empty']}个空文件、{self.stats['deleted_failed_preprocess']}个预处理失败文件\n"
-        
-        if self.stats['successfully_spliced'] > 0:
-            summary += f"- 拼接结果：成功拼接{self.stats['successfully_spliced']}个视频（总时长分别为{', '.join([f'{d:.0f}秒' for d in self.stats['spliced_durations']])}），已移动至文件夹B\n"
-        
-        if self.stats['directly_moved'] > 0:
-            summary += f"- 直接移动：{self.stats['directly_moved']}个视频（时长{', '.join([f'{d:.0f}秒' for d in self.stats['moved_durations']])}），已移动至文件夹B\n"
-        
-        if self.stats['deleted_source_files'] > 0:
-            summary += f"- 原视频处理：已删除{self.stats['deleted_source_files']}个参与拼接的原视频（因勾选\"拼接后删除\"）\n"
-        
-        if self.stats['retained_files'] > 0:
-            summary += f"- 保留文件：{self.stats['retained_files']}个视频，保留在文件夹A\n"
-        
-        self.root.after(0, lambda: messagebox.showinfo("处理结果", summary))
+        try:
+            summary = "处理完成！\n"
+            # 添加总耗时统计
+            if hasattr(self, 'processing_start_time'):
+                total_processing_time = time.time() - self.processing_start_time
+                minutes, seconds = divmod(total_processing_time, 60)
+                summary += f"- 总处理耗时：{int(minutes)}分{seconds:.1f}秒\n"
+            summary += f"- 目标拼接时长：{self.stats['target_duration']}秒\n"
+            summary += f"- 预处理：成功生成{self.stats['preprocessed_files']}个画布版视频，清理{self.stats['deleted_corrupt']}个损坏文件、{self.stats['deleted_empty']}个空文件、{self.stats['deleted_failed_preprocess']}个预处理失败文件\n"
+            
+            # 添加帧处理时间统计
+            if 'frame_processing_times' in self.stats and self.stats['frame_processing_times']:
+                total_frame_time = sum(self.stats['frame_processing_times'])
+                minutes, seconds = divmod(total_frame_time, 60)
+                summary += f"- 帧处理耗时：{int(minutes)}分{seconds:.1f}秒\n"
+            
+            if self.stats['successfully_spliced'] > 0:
+                # 计算所有拼接视频的时长
+                all_spliced_total_duration = sum(self.stats['spliced_durations'])
+                minutes, seconds = divmod(all_spliced_total_duration, 60)
+                summary += f"- 拼接结果：成功拼接{self.stats['successfully_spliced']}个视频\n"
+                summary += f"- 所有拼接视频时长：{int(minutes)}分{seconds:.1f}秒\n"
+            
+            if self.stats['directly_moved'] > 0:
+                # 计算所有直接移动视频的时长
+                all_moved_total_duration = sum(self.stats['moved_durations'])
+                minutes, seconds = divmod(all_moved_total_duration, 60)
+                summary += f"- 直接移动：{self.stats['directly_moved']}个视频\n"
+                summary += f"- 所有直接移动视频时长：{int(minutes)}分{seconds:.1f}秒\n"
+            
+            if self.stats['deleted_source_files'] > 0:
+                summary += f"- 原视频处理：已删除{self.stats['deleted_source_files']}个参与拼接的原视频（因勾选\"拼接后删除\"）\n"
+            
+            if self.stats['retained_files'] > 0:
+                summary += f"- 保留文件：{self.stats['retained_files']}个视频，保留在文件夹A\n"
+            
+            self.root.after(0, lambda: messagebox.showinfo("处理结果", summary))
+        except Exception as e:
+            logging.error(f"显示汇总信息时出错: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror("错误", f"显示处理结果时出错: {str(e)}"))
     
     def finish_processing(self):
+        # 计算处理总耗时
+        if hasattr(self, 'processing_start_time'):
+            total_processing_time = time.time() - self.processing_start_time
+            self.stats['total_processing_time'] = total_processing_time
+        
         # 完成处理，恢复UI状态
         self.is_processing = False
         self.start_button.config(state=tk.NORMAL)
