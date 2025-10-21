@@ -1,3 +1,5 @@
-moviepy
-opencv-python
-numpy
+# 核心依赖：程序实际使用的第三方库
+av>=16.0.0
+
+# 打包工具：用于生成可执行文件
+pyinstaller>=5.0.0

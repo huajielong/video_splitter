@@ -12,37 +12,21 @@ from collections import Counter
 import concurrent.futures
 import multiprocessing
 import time
+import subprocess
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 尝试导入moviepy库
-HAS_MOVIEPY = False
+# 尝试导入PyAV库
+HAS_PYAV = False
 try:
-    import moviepy
-    logger.info(f"moviepy版本: {moviepy.__version__}")
-    
-    # 根据探索脚本的结果，使用moviepy 2.1.2版本的正确导入路径
-    from moviepy.video.io.VideoFileClip import VideoFileClip
-    from moviepy.video.compositing.CompositeVideoClip import concatenate_videoclips
-    
-    # 注意：在这个版本中，resize是大写的Resize
-    try:
-        from moviepy.video.fx.Resize import Resize as resize
-        logger.info("成功导入Resize工具")
-    except ImportError:
-        # 尝试另一种可能的导入方式
-        from moviepy.video.fx.resize import resize
-        logger.info("成功导入resize工具")
-        
-    from moviepy.video.VideoClip import ColorClip
-    
-    HAS_MOVIEPY = True
-    logger.info("成功导入所有必要的moviepy模块")
-    
+    import av
+    logger.info(f"PyAV版本: {av.__version__}")
+    HAS_PYAV = True
+    logger.info("成功导入PyAV库")
 except ImportError as e:
-    logger.error(f"无法导入moviepy库: {str(e)}")
+    logger.error(f"无法导入PyAV库: {str(e)}")
     try:
         # 显示更详细的错误信息
         import sys
@@ -52,16 +36,40 @@ except ImportError as e:
     except:
         pass
 
+# 设置PyAV环境
+def setup_pyav_environment():
+    # 定义一个简单的日志函数，防止logger未定义的情况
+    def log_message(level, message):
+        try:
+            # 尝试使用全局logger
+            if level == 'info':
+                logger.info(message)
+            elif level == 'warning':
+                logger.warning(message)
+            elif level == 'error':
+                logger.error(message)
+        except NameError:
+            # 如果logger未定义，使用print
+            print(f"[{level.upper()}] {message}")
+    
+    # 检查ffmpeg是否可用（PyAV通常会使用系统安装的ffmpeg）
+    try:
+        # 尝试运行ffmpeg命令来验证它是否可用，添加creationflags参数隐藏终端窗口
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=False, 
+                      creationflags=subprocess.CREATE_NO_WINDOW)
+        log_message('info', "系统中ffmpeg已可用")
+    except (FileNotFoundError, Exception) as e:
+        log_message('warning', f"可能无法访问ffmpeg: {str(e)}")
+
+# 初始化PyAV环境
+setup_pyav_environment()
+
 class VideoSplitterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("视频自动拼接与移动工具")
         self.root.geometry("800x600")
         self.root.resizable(False, False)
-        
-        # 抑制MoviePy的帧读取警告，提高用户体验
-        # 这会抑制所有UserWarning类型的警告
-        warnings.filterwarnings("ignore", category=Warning, module="moviepy")
         
         # 设置中文字体支持
         self.style = ttk.Style()
@@ -332,18 +340,32 @@ class VideoSplitterApp:
         finally:
             # 清理临时文件
             self.cleanup_temp_files()
-            self.root.after(0, self.finish_processing)
+            # 直接调用finish_processing恢复UI状态，而不是通过after延迟
+            self.root.after(0, lambda: self._safe_finish_processing())
     
     def _preprocess_single_video(self, filename):
-        """预处理单个视频，用于并行处理"""
+        """预处理单个视频，用于并行处理，添加视频属性检查优化"""
         result = {}
         file_path = os.path.join(self.folder_a.get(), filename)
         
         try:
-            # 检查视频是否损坏
-            clip = VideoFileClip(file_path)
-            duration = clip.duration
-            clip.close()
+            # 使用PyAV检查视频是否损坏并获取视频属性
+            container = av.open(file_path)
+            
+            # 获取视频时长
+            duration = container.duration / av.time_base  # 转换为秒
+            
+            # 获取视频流信息
+            video_stream = None
+            width, height = 0, 0
+            for stream in container.streams:
+                if stream.type == 'video':
+                    video_stream = stream
+                    width = stream.width
+                    height = stream.height
+                    break
+            
+            container.close()
             
             # 检查时长是否为0
             if duration <= 0:
@@ -351,14 +373,46 @@ class VideoSplitterApp:
                 result['filename'] = filename
                 return result
             
+            # 优化策略：检查视频是否已经是9:16比例且满足条件，无需预处理
+            # 如果视频已经是竖屏且比例接近9:16（误差允许10%），可以直接使用原视频
+            if height > width and abs((width/height) - (9/16)) < 0.1:
+                self.append_status(f"视频已满足竖屏9:16比例，跳过预处理: {filename}")
+                result['status'] = 'success'
+                result['canvas_file'] = file_path  # 直接使用原文件
+                result['orig_path'] = file_path
+                result['duration'] = duration
+                result['filename'] = filename
+                result['width'] = width
+                result['height'] = height
+                return result
+            
             # 预处理：生成9:16黑色画布+画中画
-            canvas_file = self.create_canvas_video(file_path, filename)
+            canvas_file = self.create_canvas_video(file_path, filename, duration)
             if canvas_file:
                 result['status'] = 'success'
                 result['canvas_file'] = canvas_file
                 result['orig_path'] = file_path
                 result['duration'] = duration
                 result['filename'] = filename
+                # 保存尺寸信息
+                try:
+                    # 尝试快速获取生成视频的尺寸
+                    probe_cmd = [
+                        'ffprobe', '-v', 'error', 
+                        '-select_streams', 'v:0',
+                        '-show_entries', 'stream=width,height',
+                        '-of', 'csv=p=0',
+                        canvas_file
+                    ]
+                    probe_result = subprocess.run(probe_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                                creationflags=subprocess.CREATE_NO_WINDOW)
+                    dimensions = probe_result.stdout.decode().strip().split(',')
+                    result['width'] = int(dimensions[0])
+                    result['height'] = int(dimensions[1])
+                except:
+                    # 如果获取失败，使用画布默认尺寸
+                    result['width'] = 1080
+                    result['height'] = 1920
             else:
                 result['status'] = 'deleted_failed_preprocess'
                 result['filename'] = filename
@@ -371,22 +425,40 @@ class VideoSplitterApp:
         return result
     
     def preprocess_videos(self):
-        """预处理视频，支持并行处理"""
+        """预处理视频，支持并行处理，按视频属性分组优化"""
         mp4_files = [f for f in os.listdir(self.folder_a.get()) if f.lower().endswith('.mp4')]
         canvas_files = []
         total_files = len(mp4_files)
         
         # 统计变量
         processed_count = 0
+        skipped_count = 0  # 新增：跳过预处理的文件计数
         
         # 使用线程池并行处理视频
-        # 获取CPU核心数，线程数设为核心数的1-2倍（考虑到I/O等待）
-        max_workers = min(multiprocessing.cpu_count() * 2, len(mp4_files))
-        self.append_status(f"开始并行预处理视频，使用{max_workers}个线程")
+        # 最大线程数不超过6个，同时考虑CPU核心数和文件数量
+        cpu_count = multiprocessing.cpu_count()
+        recommended_workers = min(cpu_count * 2, len(mp4_files))
+        max_workers = min(recommended_workers, 6)  # 限制最大线程数为6
+        self.append_status(f"开始并行预处理视频，使用{max_workers}个线程（最大限制为6个线程）")
+        
+        # 新增：按视频属性预分类，优先处理小文件
+        # 先快速获取文件大小信息进行粗略排序
+        files_with_size = []
+        for f in mp4_files:
+            try:
+                file_path = os.path.join(self.folder_a.get(), f)
+                file_size = os.path.getsize(file_path)
+                files_with_size.append((f, file_size))
+            except:
+                files_with_size.append((f, float('inf')))  # 无法获取大小的文件放最后
+        
+        # 按文件大小升序排序，优先处理小文件
+        files_with_size.sort(key=lambda x: x[1])
+        optimized_files = [f[0] for f in files_with_size]
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有任务
-            future_to_video = {executor.submit(self._preprocess_single_video, filename): filename for filename in mp4_files}
+            future_to_video = {executor.submit(self._preprocess_single_video, filename): filename for filename in optimized_files}
             
             # 处理完成的任务
             for future in concurrent.futures.as_completed(future_to_video):
@@ -406,8 +478,17 @@ class VideoSplitterApp:
                     
                     # 根据处理结果更新统计和状态
                     if result['status'] == 'success':
-                        self.append_status(f"预处理成功: {filename}")
-                        canvas_files.append((result['canvas_file'], result['orig_path'], result['duration']))
+                        # 检查是否是跳过预处理的文件
+                        if result.get('canvas_file') == os.path.join(self.folder_a.get(), filename):
+                            skipped_count += 1
+                            # 添加视频尺寸信息到返回结果中，供后续排序使用
+                            canvas_files.append((result['canvas_file'], result['orig_path'], result['duration'], 
+                                               result.get('width', 0), result.get('height', 0)))
+                        else:
+                            self.append_status(f"预处理成功: {filename}")
+                            # 添加视频尺寸信息到返回结果中，供后续排序使用
+                            canvas_files.append((result['canvas_file'], result['orig_path'], result['duration'], 
+                                               result.get('width', 0), result.get('height', 0)))
                         self.stats['preprocessed_files'] += 1
                     elif result['status'] == 'deleted_empty':
                         self.append_status(f"文件时长为0，删除: {filename}")
@@ -435,6 +516,11 @@ class VideoSplitterApp:
                     filename = future_to_video[future]
                     self.append_status(f"处理视频时发生异常: {filename} ({str(e)})")
         
+        # 记录优化统计
+        if skipped_count > 0:
+            self.append_status(f"优化处理：跳过预处理{skipped_count}个已满足条件的视频文件")
+            self.stats['skipped_preprocess'] = skipped_count
+        
         # 检查是否有预处理失败的视频
         if self.stats['deleted_failed_preprocess'] > 0:
             self.root.after(0, lambda: messagebox.showinfo("提示", 
@@ -442,17 +528,23 @@ class VideoSplitterApp:
         
         return canvas_files
     
-    def create_canvas_video(self, video_path, filename):
+    def create_canvas_video(self, video_path, filename, duration):
         try:
             # 画布尺寸：1080x1920（9:16）
             canvas_width, canvas_height = 1080, 1920
             
-            # 加载原视频
-            video = VideoFileClip(video_path)
-            duration = video.duration
+            # 使用PyAV获取原视频尺寸
+            container = av.open(video_path)
+            stream = next((s for s in container.streams if s.type == 'video'), None)
+            if not stream:
+                raise ValueError("找不到视频流")
+            
+            # 获取视频尺寸
+            orig_width = stream.width
+            orig_height = stream.height
+            container.close()
             
             # 计算调整后的尺寸（保持原比例）
-            orig_width, orig_height = video.size
             ratio = min(canvas_width / orig_width, canvas_height / orig_height)
             new_width = int(orig_width * ratio)
             new_height = int(orig_height * ratio)
@@ -461,16 +553,12 @@ class VideoSplitterApp:
             x_pos = (canvas_width - new_width) // 2
             y_pos = (canvas_height - new_height) // 2
             
-            # 由于moviepy 2.1.2版本中CompositeVideoClip和Resize存在兼容性问题，
-            # 我们采用更简单的方法：直接使用ffmpeg命令行工具来实现视频合成
-            # 输出文件名
+            # 输出文件名 - 不再添加"画布版"后缀
             base_name = os.path.splitext(filename)[0]
-            safe_name = self.filter_filename(f"{base_name}_画布版")
+            safe_name = self.filter_filename(base_name)
             output_path = os.path.join(self.temp_dir, f"{safe_name}.mp4")
             
             # 使用ffmpeg命令行工具来创建9:16画布并将原视频居中放置
-            # 这种方法可以避免使用moviepy中存在兼容性问题的API
-            import subprocess
             # 优化FFmpeg参数，使用更快的编码预设
             ffmpeg_cmd = [
                 'ffmpeg', '-y', '-threads', '0',  # 0表示使用所有可用线程
@@ -478,17 +566,16 @@ class VideoSplitterApp:
                 '-f', 'lavfi', '-i', f'color=c=black:s={canvas_width}x{canvas_height}:d={duration}',
                 '-filter_complex', f'[0:v]scale={new_width}:{new_height}[v1];[1:v][v1]overlay={x_pos}:{y_pos}[v]',
                 '-map', '[v]', '-map', '0:a',
-                '-c:v', 'libx264', '-crf', '25', '-preset', 'ultrafast',  # 更快的预设
-                '-c:a', 'aac', '-b:a', '96k',  # 降低音频比特率以提高速度
+                '-c:v', 'libx264', '-crf', '28', '-preset', 'veryfast',  # 降低质量参数，提高速度
+                '-c:a', 'aac', '-b:a', '64k',  # 更低的音频比特率以提高速度
                 '-shortest', '-movflags', '+faststart',  # 启用快速启动
+                '-vsync', '2',  # 使用帧丢弃模式，避免不必要的帧复制
                 output_path
             ]
             
-            # 执行ffmpeg命令
-            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            # 关闭视频
-            video.close()
+            # 执行ffmpeg命令，添加creationflags参数隐藏终端窗口
+            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                          creationflags=subprocess.CREATE_NO_WINDOW)
             
             return output_path
         except Exception as e:
@@ -499,7 +586,21 @@ class VideoSplitterApp:
         # 提取文件名和原路径
         file_info = []
         
-        for canvas_file, orig_path, duration in canvas_files:
+        for item in canvas_files:
+            # 处理包含5个元素的元组 (canvas_file, orig_path, duration, width, height)
+            if len(item) >= 3:
+                canvas_file = item[0]
+                orig_path = item[1]
+                duration = item[2]
+                
+                # 从元组中获取width和height，如果没有则后续通过PyAV获取
+                width = item[3] if len(item) > 3 else 0
+                height = item[4] if len(item) > 4 else 0
+            else:
+                # 兼容旧格式
+                canvas_file, orig_path, duration = item
+                width, height = 0, 0
+                
             filename = os.path.basename(canvas_file)
             
             # 尝试提取日期
@@ -518,13 +619,17 @@ class VideoSplitterApp:
                 except:
                     pass
             
-            # 获取视频分辨率
-            try:
-                clip = VideoFileClip(canvas_file)
-                width, height = clip.size
-                clip.close()
-            except:
-                width, height = 0, 0
+            # 如果没有从元组中获取到尺寸信息，则使用PyAV获取
+            if width == 0 or height == 0:
+                try:
+                    container = av.open(canvas_file)
+                    stream = next((s for s in container.streams if s.type == 'video'), None)
+                    if stream:
+                        width = stream.width
+                        height = stream.height
+                    container.close()
+                except:
+                    width, height = 0, 0
             
             file_info.append((canvas_file, orig_path, duration, date, filename, width * height))
         
@@ -606,17 +711,13 @@ class VideoSplitterApp:
                     # 拼接视频
                     self.append_status(f"开始拼接视频序列...")
                     
-                    processing_aborted = False
-                    final_clip = None
-                    clips = []
                     try:
-                        # 优化：直接使用文件路径列表进行拼接，避免提前加载所有视频
+                        # 获取视频路径列表
                         clip_paths = [canvas_file_seq for canvas_file_seq, _, _, _, _, _ in current_sequence]
                         
                         # 在开始写入前再次检查终止标志
                         if not self.is_processing:
                             self.append_status("处理已终止，取消视频拼接")
-                            processing_aborted = True
                             break
                         
                         # 构建输出文件名
@@ -624,40 +725,31 @@ class VideoSplitterApp:
                         safe_name = self.filter_filename("+".join(base_names))
                         output_path = os.path.join(self.folder_b.get(), f"{safe_name}.mp4")
                         
-                        # 拼接视频（添加更健壮的视频加载处理）
-                        # 使用compose方法更高效地处理不同分辨率的视频
-                        clips = []
-                        for path in clip_paths:
-                            try:
-                                # 尝试加载视频，如果出现警告则继续执行
-                                with warnings.catch_warnings():
-                                    warnings.simplefilter("ignore")
-                                    clip = VideoFileClip(path)
-                                clips.append(clip)
-                            except Exception as e:
-                                self.append_status(f"加载视频文件时出错: {os.path.basename(path)} ({str(e)})")
-                                # 跳过有问题的视频，继续处理其他视频
-                                continue
-                        
-                        if not clips:
-                            self.append_status("没有成功加载的视频文件，跳过此序列的拼接")
-                            continue
-                        
-                        final_clip = concatenate_videoclips(clips, method="compose")
-                        
                         # 记录帧处理开始时间
                         frame_processing_start = time.time()
                         
-                        # 保存拼接后的视频，使用优化的编码参数
-                        final_clip.write_videofile(
-                            output_path,
-                            codec="libx264",
-                            fps=30,
-                            audio_codec="aac",
-                            preset="ultrafast",  # 使用更快的预设
-                            audio_bitrate="96k",  # 降低音频比特率以提高速度
-                            threads=None  # 自动使用多个线程
-                        )
+                        # 使用FFmpeg进行视频拼接
+                        # 1. 创建输入文件列表
+                        input_list_path = os.path.join(self.temp_dir, "input_list.txt")
+                        with open(input_list_path, 'w', encoding='utf-8') as f:
+                            for path in clip_paths:
+                                # 使用绝对路径并正确转义
+                                escaped_path = path.replace('\\', '\\\\')
+                                f.write(f"file '{escaped_path}'\n")
+                        
+                        # 2. 执行FFmpeg拼接命令
+                        ffmpeg_cmd = [
+                            'ffmpeg', '-y', '-threads', '0',
+                            '-safe', '0', '-f', 'concat', '-i', input_list_path,
+                            '-c:v', 'libx264', '-crf', '25', '-preset', 'ultrafast',
+                            '-c:a', 'aac', '-b:a', '96k',
+                            '-movflags', '+faststart',
+                            output_path
+                        ]
+                        
+                        # 执行命令
+                        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                          creationflags=subprocess.CREATE_NO_WINDOW)
                         
                         # 记录帧处理结束时间
                         frame_processing_time = time.time() - frame_processing_start
@@ -685,11 +777,13 @@ class VideoSplitterApp:
                         self.append_status(f"拼接视频时出错: {str(e)}")
                         logger.error(f"拼接视频时出错: {str(e)}")
                     finally:
-                        # 确保关闭所有视频资源
-                        if final_clip:
-                            final_clip.close()
-                        for clip in clips:
-                            clip.close()
+                        # 清理输入文件列表
+                        try:
+                            input_list_path = os.path.join(self.temp_dir, "input_list.txt")
+                            if os.path.exists(input_list_path):
+                                os.remove(input_list_path)
+                        except:
+                            pass
         
         # 删除标记的源文件
         for source_file in source_files_to_delete:
@@ -750,7 +844,14 @@ class VideoSplitterApp:
                 minutes, seconds = divmod(total_processing_time, 60)
                 summary += f"- 总处理耗时：{int(minutes)}分{seconds:.1f}秒\n"
             summary += f"- 目标拼接时长：{self.stats['target_duration']}秒\n"
-            summary += f"- 预处理：成功生成{self.stats['preprocessed_files']}个画布版视频，清理{self.stats['deleted_corrupt']}个损坏文件、{self.stats['deleted_empty']}个空文件、{self.stats['deleted_failed_preprocess']}个预处理失败文件\n"
+            # 新增：添加优化处理统计信息
+            if 'skipped_preprocess' in self.stats and self.stats['skipped_preprocess'] > 0:
+                skipped = self.stats['skipped_preprocess']
+                summary += f"- 预处理：成功生成{self.stats['preprocessed_files'] - skipped}个画布版视频，优化跳过{skipped}个已满足条件的视频\n"
+                summary += f"- 清理：{self.stats['deleted_corrupt']}个损坏文件、{self.stats['deleted_empty']}个空文件、{self.stats['deleted_failed_preprocess']}个预处理失败文件\n"
+            else:
+                summary += f"- 预处理：成功生成{self.stats['preprocessed_files']}个画布版视频\n"
+                summary += f"- 清理：{self.stats['deleted_corrupt']}个损坏文件、{self.stats['deleted_empty']}个空文件、{self.stats['deleted_failed_preprocess']}个预处理失败文件\n"
             
             # 添加帧处理时间统计
             if 'frame_processing_times' in self.stats and self.stats['frame_processing_times']:
@@ -782,6 +883,22 @@ class VideoSplitterApp:
         except Exception as e:
             logging.error(f"显示汇总信息时出错: {str(e)}")
             self.root.after(0, lambda: messagebox.showerror("错误", f"显示处理结果时出错: {str(e)}"))
+    
+    def _safe_finish_processing(self):
+        """安全地完成处理并恢复UI状态"""
+        try:
+            self.finish_processing()
+        except Exception as e:
+            # 捕获可能的异常，确保按钮状态总能恢复
+            logger.error(f"恢复UI状态时出错: {str(e)}")
+            try:
+                # 直接尝试恢复按钮状态
+                if hasattr(self, 'start_button') and hasattr(self, 'root'):
+                    self.is_processing = False
+                    self.start_button.config(state=tk.NORMAL)
+                    self.update_progress("就绪")
+            except:
+                pass
     
     def finish_processing(self):
         # 计算处理总耗时
@@ -852,11 +969,11 @@ class VideoSplitterApp:
             self.append_status(f"已清理{cleaned_files_count}个临时文件和{cleaned_dirs_count}个临时目录")
 
 if __name__ == "__main__":
-    # 先检查moviepy库是否导入成功
-    if not HAS_MOVIEPY:
+    # 先检查PyAV库是否导入成功
+    if not HAS_PYAV:
         # 如果导入失败，显示错误信息并退出
         import sys
-        print("错误: 无法导入moviepy库。请使用pip install moviepy命令安装。")
+        print("错误: 无法导入PyAV库。请使用pip install av命令安装。")
         sys.exit(1)
     
     # 如果导入成功，再创建GUI
