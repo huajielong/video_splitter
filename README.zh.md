@@ -1,9 +1,3 @@
-<p align="center">
-  ⭐ If this tool helps you, please give it a Star!
-</p>
-
----
-
 # 中文版
 
 ---
