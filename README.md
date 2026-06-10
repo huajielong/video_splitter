@@ -1,5 +1,3 @@
-> [🇨🇳 中文说明](README.zh.md)
-
 <p align="center">
   <img src="https://img.shields.io/badge/version-2.0-blue" alt="v2.0"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT"/>
@@ -21,6 +19,8 @@
   <img src="https://img.shields.io/badge/GUI-tkinter-blue" alt="tkinter"/>
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT"/>
 </p>
+
+> [中文说明](README.zh.md)
 
 ---
 
@@ -138,3 +138,62 @@ Or directly run `dist\视频自动拼接与移动工具_修复版.exe` (Windows 
                                                │  Show result summary │
                                                └──────────────────────┘
 ```
+
+---
+
+## 📁 Project Structure
+
+```
+video_splitter/
+├── video_splitter.py        # Main program (GUI application)
+├── video_splitter.spec      # PyInstaller packaging config
+├── requirements.txt         # Python dependencies
+├── images/                  # Screenshots
+│   └── program_interface.svg
+├── dist/                    # Pre-built executables
+├── Windows多版本兼容性说明.md # Windows compatibility notes (ZH)
+└── README.md                # 💡 You are here
+```
+
+---
+
+## ❓ FAQ
+
+<details>
+<summary><b>Getting "FFmpeg not found" error?</b></summary>
+The program depends on FFmpeg for video processing. Download it from <a href="https://ffmpeg.org/download.html">ffmpeg.org</a>, add it to your system PATH, or place ffmpeg.exe in the same directory as the program.
+</details>
+
+<details>
+<summary><b>No audio in the concatenated video?</b></summary>
+Make sure the source videos contain audio tracks. The program processes audio streams automatically — if the source has no audio, the output will be silent too.
+</details>
+
+<details>
+<summary><b>Lag when processing very large files (>1GB)?</b></summary>
+Processing large files takes more time. Please be patient. A more powerful computer is recommended for large video files.
+</details>
+
+<details>
+<summary><b>Can I package it as an exe for others?</b></summary>
+Yes. Install PyInstaller and run: <code>pyinstaller video_splitter.spec</code>, or use <code>pyinstaller --onefile --windowed video_splitter.py</code> to generate a single-file exe.
+</details>
+
+<details>
+<summary><b>Are there any filename date format requirements?</b></summary>
+The program recognizes "year-month-day" (e.g., 2024-05-20) and "YYYYMMDD" (e.g., 20240520) formats. Files without recognizable dates are processed in default order.
+</details>
+
+---
+
+## 🤝 Contributing
+
+Contributions of all kinds are welcome — open an Issue, submit a Pull Request, or improve the documentation.
+
+<a href="https://github.com/huajielong/video_splitter/graphs/contributors">
+  <img src="https://img.shields.io/badge/contributions-welcome-brightgreen" alt="Contributions Welcome"/>
+</a>
+
+## 📄 License
+
+MIT © [huajielong](https://github.com/huajielong)
