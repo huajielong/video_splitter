@@ -20,6 +20,8 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT"/>
 </p>
 
+> [中文说明](README.zh.md)
+
 ---
 
 ## 🤔 Tired of Manually Concatenating Videos?
@@ -201,5 +203,3 @@ MIT © [huajielong](https://github.com/huajielong)
 <p align="center">
   ⭐ If this tool helps you, please give it a Star!
 </p>
-
-> [中文说明](README.zh.md)
